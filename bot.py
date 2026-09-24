@@ -44,22 +44,22 @@ PORT = int(os.getenv("PORT", "8080"))
 
 FORCE_SUB_CHATS = [
     {
-        "name": "Yaplol - Admin",
+        "name": "Admin",
         "chat_id": "@yaplol",
         "link": "https://t.me/yaplol",
     },
     {
-        "name": "Concisly - Channel",
-        "chat_id": "@Concisely",
-        "link": "https://t.me/Concisely",
+    "name": "Channel",
+    "chat_id": "@concisly",
+    "link": "https://t.me/concisly",
     },
     {
-        "name": "Confably - Group",
+        "name": "Group",
         "chat_id": -1004437811106,
         "link": "https://t.me/confably",
     },
     {
-        "name": "Subtaxer - VIBE CH",
+        "name": "VIBE CH",
         "chat_id": "@subtaxer",
         "link": "https://t.me/subtaxer",
     },
