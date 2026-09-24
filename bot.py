@@ -1,9 +1,20 @@
 import os
 import asyncio
 import logging
+from io import BytesIO
+
 from aiohttp import web
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Bot
+from PIL import Image
+from pillow_heif import register_heif_opener
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Bot,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,6 +26,7 @@ from telegram.ext import (
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import BadRequest, Forbidden
 
+register_heif_opener()
 load_dotenv()
 
 logging.basicConfig(
@@ -51,11 +63,6 @@ if not BOT_TOKEN:
 if not CHECK_BOT_TOKEN:
     raise RuntimeError("CHECK_BOT_TOKEN is missing from .env")
 
-if len(FORCE_SUB_LINKS) < len(FORCE_SUB_CHANNELS):
-    logger.warning(
-        "Some force-sub chats do not have join links configured"
-    )
-
 user_state = {}
 
 
@@ -88,7 +95,8 @@ def get_chat_id(value: str):
 
 def get_join_link(value: str, index: int):
     if index < len(FORCE_SUB_LINKS):
-        link = FORCE_SUB_LINKS[index]
+        link = FORCE_SUB_LINKS[index].strip()
+
         if link:
             return link
 
@@ -98,48 +106,6 @@ def get_join_link(value: str, index: int):
         return None
 
     return f"https://t.me/{value.lstrip('@')}"
-
-
-async def is_joined(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-) -> bool:
-    check_bot = context.bot_data.get("check_bot")
-
-    if check_bot is None:
-        logger.error("CHECK_BOT_TOKEN is not initialized")
-        return False
-
-    for chat in FORCE_SUB_CHANNELS:
-        chat_id = get_chat_id(chat)
-
-        try:
-            member = await check_bot.get_chat_member(
-                chat_id=chat_id,
-                user_id=user_id,
-            )
-
-            if member.status in (
-                ChatMemberStatus.LEFT,
-                ChatMemberStatus.BANNED,
-            ):
-                return False
-
-            if (
-                member.status == ChatMemberStatus.RESTRICTED
-                and not member.is_member
-            ):
-                return False
-
-        except (BadRequest, Forbidden) as e:
-            logger.error(
-                "Membership check failed for %s: %s",
-                chat,
-                e,
-            )
-            return False
-
-    return True
 
 
 def join_markup():
@@ -172,6 +138,48 @@ def join_markup():
     ])
 
     return InlineKeyboardMarkup(rows)
+
+
+async def is_joined(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+) -> bool:
+    check_bot = context.bot_data.get("check_bot")
+
+    if check_bot is None:
+        logger.error("Check bot is not initialized")
+        return False
+
+    for chat in FORCE_SUB_CHANNELS:
+        chat_id = get_chat_id(chat)
+
+        try:
+            member = await check_bot.get_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+
+            if member.status in (
+                ChatMemberStatus.LEFT,
+                ChatMemberStatus.BANNED,
+            ):
+                return False
+
+            if (
+                member.status == ChatMemberStatus.RESTRICTED
+                and not member.is_member
+            ):
+                return False
+
+        except (BadRequest, Forbidden) as e:
+            logger.error(
+                "Membership check failed for %s: %s",
+                chat,
+                e,
+            )
+            return False
+
+    return True
 
 
 FORCE_SUB_TEXT = (
@@ -217,8 +225,8 @@ def cancel_markup():
             InlineKeyboardButton(
                 "❌ Cancel",
                 callback_data="menu_cancel",
-            ),
-        ],
+            )
+        ]
     ])
 
 
@@ -271,6 +279,94 @@ async def delete_silently(
         pass
 
 
+async def create_thumbnail(
+    context: ContextTypes.DEFAULT_TYPE,
+    thumb_id: str,
+    output_path: str,
+):
+    thumb_file = await context.bot.get_file(thumb_id)
+    source = BytesIO()
+
+    await thumb_file.download_to_memory(
+        out=source
+    )
+
+    source.seek(0)
+
+    with Image.open(source) as image:
+        image = image.convert("RGB")
+
+        image.thumbnail(
+            (320, 320),
+            Image.Resampling.LANCZOS,
+        )
+
+        for quality in range(90, 14, -5):
+            buffer = BytesIO()
+
+            image.save(
+                buffer,
+                format="JPEG",
+                quality=quality,
+                optimize=True,
+                progressive=True,
+            )
+
+            data = buffer.getvalue()
+
+            if len(data) < 200 * 1024:
+                with open(
+                    output_path,
+                    "wb",
+                ) as f:
+                    f.write(data)
+
+                return
+
+        image.thumbnail(
+            (180, 180),
+            Image.Resampling.LANCZOS,
+        )
+
+        image.save(
+            output_path,
+            format="JPEG",
+            quality=50,
+            optimize=True,
+        )
+
+    if os.path.getsize(output_path) >= 200 * 1024:
+        raise RuntimeError(
+            "Thumbnail is larger than 200 KB"
+        )
+
+
+async def show_file_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict,
+):
+    message = update.message
+
+    if state.get("menu_msg_id"):
+        await set_menu(
+            context,
+            state["menu_chat_id"],
+            state["menu_msg_id"],
+            file_summary_text(state),
+            file_menu_markup(),
+        )
+    else:
+        sent = await message.reply_text(
+            file_summary_text(state),
+            reply_markup=file_menu_markup(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        state["menu_chat_id"] = sent.chat_id
+        state["menu_msg_id"] = sent.message_id
+
+
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -312,15 +408,18 @@ async def check_join_callback(
         query.from_user.id,
     ):
         await query.answer()
+
         await query.edit_message_text(
             "✅ **Access granted!** Send me a file to begin.",
             parse_mode=ParseMode.MARKDOWN,
         )
-    else:
-        await query.answer(
-            "❗ You haven't joined all channels/groups yet.",
-            show_alert=True,
-        )
+
+        return
+
+    await query.answer(
+        "❗ You haven't joined all channels/groups yet.",
+        show_alert=True,
+    )
 
 
 async def file_handler(
@@ -339,17 +438,47 @@ async def file_handler(
         return
 
     msg = update.message
+    state = get_state(
+        msg.from_user.id
+    )
+
+    if (
+        msg.document
+        and state.get("waiting") == "thumb"
+    ):
+        state["thumb_id"] = msg.document.file_id
+        state["waiting"] = None
+
+        await delete_silently(
+            context,
+            msg.chat_id,
+            msg.message_id,
+        )
+
+        await show_file_menu(
+            update,
+            context,
+            state,
+        )
+
+        return
 
     if msg.document:
         file_id = msg.document.file_id
-        file_name = msg.document.file_name or "file"
+        file_name = (
+            msg.document.file_name
+            or "file"
+        )
+
     elif msg.video:
         file_id = msg.video.file_id
-        file_name = msg.video.file_name or "video.mp4"
+        file_name = (
+            msg.video.file_name
+            or "video.mp4"
+        )
+
     else:
         return
-
-    state = get_state(msg.from_user.id)
 
     state.update({
         "file_id": file_id,
@@ -360,14 +489,11 @@ async def file_handler(
         "waiting": None,
     })
 
-    sent = await msg.reply_text(
-        file_summary_text(state),
-        reply_markup=file_menu_markup(),
-        parse_mode=ParseMode.MARKDOWN,
+    await show_file_menu(
+        update,
+        context,
+        state,
     )
-
-    state["menu_chat_id"] = sent.chat_id
-    state["menu_msg_id"] = sent.message_id
 
 
 async def menu_rename(
@@ -375,7 +501,9 @@ async def menu_rename(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
-    state = get_state(query.from_user.id)
+    state = get_state(
+        query.from_user.id
+    )
 
     if not state.get("file_id"):
         await query.answer(
@@ -402,7 +530,9 @@ async def menu_thumb(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
-    state = get_state(query.from_user.id)
+    state = get_state(
+        query.from_user.id
+    )
 
     if not state.get("file_id"):
         await query.answer(
@@ -417,7 +547,7 @@ async def menu_thumb(
         context,
         query.message.chat_id,
         query.message.message_id,
-        "🖼️ **Send a photo** to use as the thumbnail.",
+        "🖼️ **Send a JPG, JPEG, PNG, HEIC, HEIF, WEBP or another supported image.**",
         cancel_markup(),
     )
 
@@ -429,7 +559,9 @@ async def menu_caption(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
-    state = get_state(query.from_user.id)
+    state = get_state(
+        query.from_user.id
+    )
 
     if not state.get("file_id"):
         await query.answer(
@@ -456,7 +588,9 @@ async def menu_cancel(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
-    state = get_state(query.from_user.id)
+    state = get_state(
+        query.from_user.id
+    )
 
     state["waiting"] = None
 
@@ -498,7 +632,9 @@ async def menu_done(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
-    state = get_state(query.from_user.id)
+    state = get_state(
+        query.from_user.id
+    )
 
     if not state.get("file_id"):
         await query.answer(
@@ -528,7 +664,17 @@ async def menu_done(
     )
 
     file_id = state["file_id"]
-    file_name = state["rename"] or state["file_name"]
+
+    file_name = (
+        state.get("rename")
+        or state.get("file_name")
+        or "file"
+    )
+
+    file_name = os.path.basename(
+        file_name
+    )
+
     file_path = os.path.join(
         user_dir,
         file_name,
@@ -545,26 +691,35 @@ async def menu_done(
             file_path
         )
 
-        thumb_id = state.get("thumb_id")
+        if not os.path.exists(file_path):
+            raise RuntimeError(
+                "Downloaded file was not created"
+            )
 
-        if thumb_id:
+        if os.path.getsize(file_path) == 0:
+            raise RuntimeError(
+                "Downloaded file is empty"
+            )
+
+        if state.get("thumb_id"):
             thumb_path = os.path.join(
                 user_dir,
                 "thumb.jpg",
             )
 
-            thumb_file = await context.bot.get_file(
-                thumb_id
+            await set_menu(
+                context,
+                query.message.chat_id,
+                query.message.message_id,
+                "🖼️ **Preparing thumbnail...**",
+                None,
             )
 
-            await thumb_file.download_to_drive(
-                thumb_path
+            await create_thumbnail(
+                context,
+                state["thumb_id"],
+                thumb_path,
             )
-
-        caption_text = (
-            state.get("caption")
-            or CREDIT_TEXT
-        )
 
         await set_menu(
             context,
@@ -574,90 +729,155 @@ async def menu_done(
             None,
         )
 
-        with open(file_path, "rb") as f:
-            thumb_file_obj = (
-                open(
+        caption_text = (
+            state.get("caption")
+            or CREDIT_TEXT
+        )
+
+        caption_parse_mode = (
+            None
+            if state.get("caption")
+            else ParseMode.MARKDOWN
+        )
+
+        with open(
+            file_path,
+            "rb",
+        ) as document_file:
+            if thumb_path:
+                with open(
                     thumb_path,
                     "rb",
-                )
-                if thumb_path
-                else None
-            )
-
-            try:
+                ) as thumbnail_file:
+                    await context.bot.send_document(
+                        chat_id=query.from_user.id,
+                        document=document_file,
+                        thumbnail=thumbnail_file,
+                        filename=file_name,
+                        caption=caption_text,
+                        parse_mode=caption_parse_mode,
+                        read_timeout=180,
+                        write_timeout=180,
+                        connect_timeout=30,
+                        pool_timeout=30,
+                    )
+            else:
                 await context.bot.send_document(
                     chat_id=query.from_user.id,
-                    document=f,
-                    thumbnail=thumb_file_obj,
+                    document=document_file,
+                    filename=file_name,
                     caption=caption_text,
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=caption_parse_mode,
+                    read_timeout=180,
+                    write_timeout=180,
+                    connect_timeout=30,
+                    pool_timeout=30,
                 )
-            finally:
-                if thumb_file_obj:
-                    thumb_file_obj.close()
+
+        user_state.pop(
+            query.from_user.id,
+            None,
+        )
+
+        await delete_silently(
+            context,
+            query.message.chat_id,
+            query.message.message_id,
+        )
+
+    except Exception as e:
+        logger.exception(
+            "Failed to send final file"
+        )
+
+        error_text = (
+            str(e).strip()
+            or "Unknown upload error"
+        )
+
+        if len(error_text) > 350:
+            error_text = error_text[:350]
+
+        await set_menu(
+            context,
+            query.message.chat_id,
+            query.message.message_id,
+            f"❌ **Upload failed**\n\n`{error_text}`",
+            file_menu_markup(),
+        )
 
     finally:
         if os.path.exists(file_path):
-            os.remove(file_path)
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
         if (
             thumb_path
             and os.path.exists(thumb_path)
         ):
-            os.remove(thumb_path)
-
-    user_state.pop(
-        query.from_user.id,
-        None,
-    )
-
-    await delete_silently(
-        context,
-        query.message.chat_id,
-        query.message.message_id,
-    )
+            try:
+                os.remove(thumb_path)
+            except OSError:
+                pass
 
 
 async def photo_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    state = get_state(
-        update.effective_user.id
-    )
-
-    if state.get("waiting") != "thumb":
-        return
-
-    state["thumb_id"] = (
-        update.message.photo[-1].file_id
-    )
-
-    state["waiting"] = None
-
-    await delete_silently(
+    if not await is_joined(
         context,
-        update.message.chat_id,
-        update.message.message_id,
-    )
-
-    if state.get("menu_msg_id"):
-        await set_menu(
-            context,
-            state["menu_chat_id"],
-            state["menu_msg_id"],
-            file_summary_text(state),
-            file_menu_markup(),
-        )
-    else:
-        sent = await update.message.reply_text(
-            file_summary_text(state),
-            reply_markup=file_menu_markup(),
+        update.effective_user.id,
+    ):
+        await update.message.reply_text(
+            FORCE_SUB_TEXT,
+            reply_markup=join_markup(),
             parse_mode=ParseMode.MARKDOWN,
         )
+        return
 
-        state["menu_chat_id"] = sent.chat_id
-        state["menu_msg_id"] = sent.message_id
+    msg = update.message
+    state = get_state(
+        msg.from_user.id
+    )
+
+    if state.get("waiting") == "thumb":
+        state["thumb_id"] = (
+            msg.photo[-1].file_id
+        )
+
+        state["waiting"] = None
+
+        await delete_silently(
+            context,
+            msg.chat_id,
+            msg.message_id,
+        )
+
+        await show_file_menu(
+            update,
+            context,
+            state,
+        )
+
+        return
+
+    state.update({
+        "file_id": msg.photo[-1].file_id,
+        "file_name": "photo.jpg",
+        "thumb_id": None,
+        "caption": None,
+        "rename": None,
+        "waiting": None,
+    })
+
+    await show_file_menu(
+        update,
+        context,
+        state,
+    )
 
 
 async def text_handler(
@@ -666,7 +886,10 @@ async def text_handler(
 ):
     msg = update.message
 
-    if msg.text.startswith("/"):
+    if (
+        not msg.text
+        or msg.text.startswith("/")
+    ):
         return
 
     state = get_state(
@@ -682,7 +905,15 @@ async def text_handler(
         return
 
     if waiting == "rename":
-        state["rename"] = msg.text.strip()
+        new_name = msg.text.strip()
+
+        if not new_name:
+            return
+
+        state["rename"] = os.path.basename(
+            new_name
+        )
+
     else:
         state["caption"] = msg.text
 
@@ -694,23 +925,11 @@ async def text_handler(
         msg.message_id,
     )
 
-    if state.get("menu_msg_id"):
-        await set_menu(
-            context,
-            state["menu_chat_id"],
-            state["menu_msg_id"],
-            file_summary_text(state),
-            file_menu_markup(),
-        )
-    else:
-        sent = await msg.reply_text(
-            file_summary_text(state),
-            reply_markup=file_menu_markup(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
-        state["menu_chat_id"] = sent.chat_id
-        state["menu_msg_id"] = sent.message_id
+    await show_file_menu(
+        update,
+        context,
+        state,
+    )
 
 
 async def handle_ping(request):
