@@ -17,9 +17,11 @@ from telegram import (
 )
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    TypeHandler,
     filters,
     ContextTypes,
 )
@@ -40,28 +42,47 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHECK_BOT_TOKEN = os.getenv("CHECK_BOT_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-FORCE_SUB_CHANNELS = [
-    item.strip()
-    for item in os.getenv("FORCE_SUB_CHANNELS", "").split(",")
-    if item.strip()
-]
-
-FORCE_SUB_LINKS = [
-    item.strip()
-    for item in os.getenv("FORCE_SUB_LINKS", "").split(",")
-    if item.strip()
+FORCE_SUB_CHATS = [
+    {
+        "name": "Yaplol - Admin",
+        "chat_id": "@yaplol",
+        "link": "https://t.me/yaplol",
+    },
+    {
+        "name": "Concisly - Channel",
+        "chat_id": "@Concisely",
+        "link": "https://t.me/Concisely",
+    },
+    {
+        "name": "Confably - Group",
+        "chat_id": -1004437811106,
+        "link": "https://t.me/confably",
+    },
+    {
+        "name": "Subtaxer - VIBE CH",
+        "chat_id": "@subtaxer",
+        "link": "https://t.me/subtaxer",
+    },
 ]
 
 CREDIT_TEXT = "**Admin:** [Hazy](https://t.me/oky989)\n**Channel:** @Subtaxer"
+
 DOWNLOAD_DIR = "downloads"
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(
+    DOWNLOAD_DIR,
+    exist_ok=True,
+)
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing from .env")
+    raise RuntimeError(
+        "BOT_TOKEN is missing from .env"
+    )
 
 if not CHECK_BOT_TOKEN:
-    raise RuntimeError("CHECK_BOT_TOKEN is missing from .env")
+    raise RuntimeError(
+        "CHECK_BOT_TOKEN is missing from .env"
+    )
 
 user_state = {}
 
@@ -78,54 +99,139 @@ def get_state(user_id: int) -> dict:
             "menu_chat_id": None,
             "menu_msg_id": None,
         }
+
     return user_state[user_id]
 
 
-def get_chat_id(value: str):
-    value = value.strip()
+async def validate_force_sub_chats(
+    check_bot: Bot,
+):
+    me = await check_bot.get_me()
 
-    if value.lstrip("-").isdigit():
-        return int(value)
+    logger.info(
+        "Checking force-sub configuration with @%s",
+        me.username or me.first_name,
+    )
 
-    if value.startswith("@"):
-        return value
+    for chat in FORCE_SUB_CHATS:
+        try:
+            chat_info = await check_bot.get_chat(
+                chat_id=chat["chat_id"]
+            )
 
-    return f"@{value}"
+            member = await check_bot.get_chat_member(
+                chat_id=chat["chat_id"],
+                user_id=me.id,
+            )
+
+            if member.status not in (
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER,
+            ):
+                raise RuntimeError(
+                    f"Check bot is not administrator in {chat['name']}"
+                )
+
+            logger.info(
+                "Verified force-sub: %s | %s | %s | %s",
+                chat["name"],
+                chat_info.id,
+                chat_info.type,
+                member.status,
+            )
+
+        except (BadRequest, Forbidden) as e:
+            raise RuntimeError(
+                f"Cannot access required force-sub chat "
+                f"{chat['name']}: {e}"
+            ) from e
 
 
-def get_join_link(value: str, index: int):
-    if index < len(FORCE_SUB_LINKS):
-        link = FORCE_SUB_LINKS[index].strip()
+async def is_joined(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+) -> bool:
+    check_bot = context.bot_data.get(
+        "check_bot"
+    )
 
-        if link:
-            return link
+    if check_bot is None:
+        logger.error(
+            "Check bot is not available"
+        )
+        return False
 
-    value = value.strip()
+    for chat in FORCE_SUB_CHATS:
+        try:
+            member = await check_bot.get_chat_member(
+                chat_id=chat["chat_id"],
+                user_id=user_id,
+            )
 
-    if value.lstrip("-").isdigit():
-        return None
+            if member.status in (
+                ChatMemberStatus.LEFT,
+                ChatMemberStatus.BANNED,
+            ):
+                logger.info(
+                    "User %s not joined: %s",
+                    user_id,
+                    chat["name"],
+                )
+                return False
 
-    return f"https://t.me/{value.lstrip('@')}"
+            if (
+                member.status
+                == ChatMemberStatus.RESTRICTED
+                and not member.is_member
+            ):
+                logger.info(
+                    "User %s restricted/non-member: %s",
+                    user_id,
+                    chat["name"],
+                )
+                return False
+
+            if member.status not in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER,
+                ChatMemberStatus.RESTRICTED,
+            ):
+                logger.info(
+                    "User %s invalid membership status in %s: %s",
+                    user_id,
+                    chat["name"],
+                    member.status,
+                )
+                return False
+
+        except (BadRequest, Forbidden) as e:
+            logger.error(
+                "Membership check failed for %s and user %s: %s",
+                chat["name"],
+                user_id,
+                e,
+            )
+            return False
+
+    return True
 
 
 def join_markup():
     rows = []
     row = []
 
-    for index, chat in enumerate(FORCE_SUB_CHANNELS):
-        link = get_join_link(chat, index)
-
-        if link:
-            row.append(
-                InlineKeyboardButton(
-                    f"📢 {chat.lstrip('@')}",
-                    url=link,
-                )
+    for chat in FORCE_SUB_CHATS:
+        row.append(
+            InlineKeyboardButton(
+                f"📢 {chat['name']}",
+                url=chat["link"],
             )
+        )
 
-            if len(row) == 2:
-                rows.append(row)
-                row = []
+        if len(row) == 2:
+            rows.append(row)
+            row = []
 
     if row:
         rows.append(row)
@@ -140,52 +246,58 @@ def join_markup():
     return InlineKeyboardMarkup(rows)
 
 
-async def is_joined(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-) -> bool:
-    check_bot = context.bot_data.get("check_bot")
-
-    if check_bot is None:
-        logger.error("Check bot is not initialized")
-        return False
-
-    for chat in FORCE_SUB_CHANNELS:
-        chat_id = get_chat_id(chat)
-
-        try:
-            member = await check_bot.get_chat_member(
-                chat_id=chat_id,
-                user_id=user_id,
-            )
-
-            if member.status in (
-                ChatMemberStatus.LEFT,
-                ChatMemberStatus.BANNED,
-            ):
-                return False
-
-            if (
-                member.status == ChatMemberStatus.RESTRICTED
-                and not member.is_member
-            ):
-                return False
-
-        except (BadRequest, Forbidden) as e:
-            logger.error(
-                "Membership check failed for %s: %s",
-                chat,
-                e,
-            )
-            return False
-
-    return True
-
-
 FORCE_SUB_TEXT = (
     "🔒 **Access Restricted**\n\n"
-    "Please join the channel(s) below to use this bot, then tap **I've Joined**."
+    "You must join all required channels/groups before using this bot.\n\n"
+    "Join all of them, then press **✅ I've Joined**."
 )
+
+
+async def membership_gate(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+
+    if user is None:
+        return
+
+    query = update.callback_query
+
+    if (
+        query is not None
+        and query.data == "check_join"
+    ):
+        return
+
+    if await is_joined(
+        context,
+        user.id,
+    ):
+        return
+
+    if query is not None:
+        try:
+            await query.answer(
+                "❗ Please join all required channels/groups first.",
+                show_alert=True,
+            )
+        except BadRequest:
+            pass
+
+    message = update.effective_message
+
+    if message is not None:
+        try:
+            await message.reply_text(
+                FORCE_SUB_TEXT,
+                reply_markup=join_markup(),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except (BadRequest, Forbidden):
+            pass
+
+    raise ApplicationHandlerStop
 
 
 def file_menu_markup():
@@ -231,9 +343,23 @@ def cancel_markup():
 
 
 def file_summary_text(state: dict) -> str:
-    name = state.get("rename") or state.get("file_name") or "—"
-    thumb = "✅" if state.get("thumb_id") else "—"
-    caption = "✅" if state.get("caption") else "—"
+    name = (
+        state.get("rename")
+        or state.get("file_name")
+        or "—"
+    )
+
+    thumb = (
+        "✅"
+        if state.get("thumb_id")
+        else "—"
+    )
+
+    caption = (
+        "✅"
+        if state.get("caption")
+        else "—"
+    )
 
     return (
         "📁 **File ready** — choose an option:\n\n"
@@ -284,7 +410,10 @@ async def create_thumbnail(
     thumb_id: str,
     output_path: str,
 ):
-    thumb_file = await context.bot.get_file(thumb_id)
+    thumb_file = await context.bot.get_file(
+        thumb_id
+    )
+
     source = BytesIO()
 
     await thumb_file.download_to_memory(
@@ -293,51 +422,63 @@ async def create_thumbnail(
 
     source.seek(0)
 
-    with Image.open(source) as image:
-        image = image.convert("RGB")
+    try:
+        with Image.open(source) as image:
+            image = image.convert("RGB")
 
-        image.thumbnail(
-            (320, 320),
-            Image.Resampling.LANCZOS,
-        )
-
-        for quality in range(90, 14, -5):
-            buffer = BytesIO()
-
-            image.save(
-                buffer,
-                format="JPEG",
-                quality=quality,
-                optimize=True,
-                progressive=True,
+            image.thumbnail(
+                (320, 320),
+                Image.Resampling.LANCZOS,
             )
 
-            data = buffer.getvalue()
+            for quality in range(
+                90,
+                14,
+                -5,
+            ):
+                buffer = BytesIO()
 
-            if len(data) < 200 * 1024:
-                with open(
-                    output_path,
-                    "wb",
-                ) as f:
-                    f.write(data)
+                image.save(
+                    buffer,
+                    format="JPEG",
+                    quality=quality,
+                    optimize=True,
+                    progressive=True,
+                )
 
-                return
+                data = buffer.getvalue()
 
-        image.thumbnail(
-            (180, 180),
-            Image.Resampling.LANCZOS,
-        )
+                if len(data) < 200 * 1024:
+                    with open(
+                        output_path,
+                        "wb",
+                    ) as f:
+                        f.write(data)
 
-        image.save(
-            output_path,
-            format="JPEG",
-            quality=50,
-            optimize=True,
-        )
+                    return
 
-    if os.path.getsize(output_path) >= 200 * 1024:
+            image.thumbnail(
+                (180, 180),
+                Image.Resampling.LANCZOS,
+            )
+
+            image.save(
+                output_path,
+                format="JPEG",
+                quality=50,
+                optimize=True,
+            )
+
+    except Exception as e:
         raise RuntimeError(
-            "Thumbnail is larger than 200 KB"
+            f"Invalid thumbnail image: {e}"
+        ) from e
+
+    if os.path.getsize(
+        output_path
+    ) >= 200 * 1024:
+        raise RuntimeError(
+            "Thumbnail could not be compressed below 200 KB"
         )
 
 
@@ -346,7 +487,10 @@ async def show_file_menu(
     context: ContextTypes.DEFAULT_TYPE,
     state: dict,
 ):
-    message = update.message
+    message = update.effective_message
+
+    if message is None:
+        return
 
     if state.get("menu_msg_id"):
         await set_menu(
@@ -371,20 +515,10 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not await is_joined(
-        context,
-        update.effective_user.id,
-    ):
-        await update.message.reply_text(
-            FORCE_SUB_TEXT,
-            reply_markup=join_markup(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
     await update.message.reply_text(
         "👋 **Welcome!**\n\n"
-        "Send me any file (document or video) to get started. You'll then be able to:\n\n"
+        "Send me any file to get started.\n\n"
+        "You can then:\n\n"
         "✏️ Rename it\n"
         "🖼️ Add a thumbnail\n"
         "📝 Add a caption\n"
@@ -403,21 +537,27 @@ async def check_join_callback(
 ):
     query = update.callback_query
 
-    if await is_joined(
+    joined = await is_joined(
         context,
         query.from_user.id,
-    ):
+    )
+
+    if joined:
         await query.answer()
 
-        await query.edit_message_text(
-            "✅ **Access granted!** Send me a file to begin.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        try:
+            await query.edit_message_text(
+                "✅ **Access granted!**\n\n"
+                "Send me a file to begin.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except BadRequest:
+            pass
 
         return
 
     await query.answer(
-        "❗ You haven't joined all channels/groups yet.",
+        "❗ You haven't joined all required channels/groups.",
         show_alert=True,
     )
 
@@ -426,33 +566,29 @@ async def file_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not await is_joined(
-        context,
-        update.effective_user.id,
-    ):
-        await update.message.reply_text(
-            FORCE_SUB_TEXT,
-            reply_markup=join_markup(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    message = update.message
+
+    if message is None:
         return
 
-    msg = update.message
     state = get_state(
-        msg.from_user.id
+        message.from_user.id
     )
 
     if (
-        msg.document
+        message.document
         and state.get("waiting") == "thumb"
     ):
-        state["thumb_id"] = msg.document.file_id
+        state["thumb_id"] = (
+            message.document.file_id
+        )
+
         state["waiting"] = None
 
         await delete_silently(
             context,
-            msg.chat_id,
-            msg.message_id,
+            message.chat_id,
+            message.message_id,
         )
 
         await show_file_menu(
@@ -463,17 +599,19 @@ async def file_handler(
 
         return
 
-    if msg.document:
-        file_id = msg.document.file_id
+    if message.document:
+        file_id = message.document.file_id
+
         file_name = (
-            msg.document.file_name
+            message.document.file_name
             or "file"
         )
 
-    elif msg.video:
-        file_id = msg.video.file_id
+    elif message.video:
+        file_id = message.video.file_id
+
         file_name = (
-            msg.video.file_name
+            message.video.file_name
             or "video.mp4"
         )
 
@@ -501,6 +639,7 @@ async def menu_rename(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     state = get_state(
         query.from_user.id
     )
@@ -518,7 +657,7 @@ async def menu_rename(
         context,
         query.message.chat_id,
         query.message.message_id,
-        "✏️ **Send the new filename** (with extension).",
+        "✏️ **Send the new filename** with extension.",
         cancel_markup(),
     )
 
@@ -530,6 +669,7 @@ async def menu_thumb(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     state = get_state(
         query.from_user.id
     )
@@ -547,7 +687,8 @@ async def menu_thumb(
         context,
         query.message.chat_id,
         query.message.message_id,
-        "🖼️ **Send a JPG, JPEG, PNG, HEIC, HEIF, WEBP or another supported image.**",
+        "🖼️ **Send the thumbnail image.**\n\n"
+        "JPG, JPEG, PNG, HEIC, HEIF, WEBP and other supported image files are accepted.",
         cancel_markup(),
     )
 
@@ -559,6 +700,7 @@ async def menu_caption(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     state = get_state(
         query.from_user.id
     )
@@ -588,6 +730,7 @@ async def menu_cancel(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     state = get_state(
         query.from_user.id
     )
@@ -632,6 +775,7 @@ async def menu_done(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     state = get_state(
         query.from_user.id
     )
@@ -641,6 +785,27 @@ async def menu_done(
             "❗ Send a file first.",
             show_alert=True,
         )
+        return
+
+    joined = await is_joined(
+        context,
+        query.from_user.id,
+    )
+
+    if not joined:
+        await query.answer(
+            "❗ You must remain joined to all required channels/groups.",
+            show_alert=True,
+        )
+
+        await set_menu(
+            context,
+            query.message.chat_id,
+            query.message.message_id,
+            FORCE_SUB_TEXT,
+            join_markup(),
+        )
+
         return
 
     await query.answer()
@@ -683,20 +848,24 @@ async def menu_done(
     thumb_path = None
 
     try:
-        new_file = await context.bot.get_file(
+        telegram_file = await context.bot.get_file(
             file_id
         )
 
-        await new_file.download_to_drive(
+        await telegram_file.download_to_drive(
             file_path
         )
 
-        if not os.path.exists(file_path):
+        if not os.path.exists(
+            file_path
+        ):
             raise RuntimeError(
                 "Downloaded file was not created"
             )
 
-        if os.path.getsize(file_path) == 0:
+        if os.path.getsize(
+            file_path
+        ) == 0:
             raise RuntimeError(
                 "Downloaded file is empty"
             )
@@ -744,11 +913,13 @@ async def menu_done(
             file_path,
             "rb",
         ) as document_file:
+
             if thumb_path:
                 with open(
                     thumb_path,
                     "rb",
                 ) as thumbnail_file:
+
                     await context.bot.send_document(
                         chat_id=query.from_user.id,
                         document=document_file,
@@ -761,6 +932,7 @@ async def menu_done(
                         connect_timeout=30,
                         pool_timeout=30,
                     )
+
             else:
                 await context.bot.send_document(
                     chat_id=query.from_user.id,
@@ -787,7 +959,7 @@ async def menu_done(
 
     except Exception as e:
         logger.exception(
-            "Failed to send final file"
+            "Final file upload failed"
         )
 
         error_text = (
@@ -795,8 +967,8 @@ async def menu_done(
             or "Unknown upload error"
         )
 
-        if len(error_text) > 350:
-            error_text = error_text[:350]
+        if len(error_text) > 400:
+            error_text = error_text[:400]
 
         await set_menu(
             context,
@@ -807,18 +979,26 @@ async def menu_done(
         )
 
     finally:
-        if os.path.exists(file_path):
+        if os.path.exists(
+            file_path
+        ):
             try:
-                os.remove(file_path)
+                os.remove(
+                    file_path
+                )
             except OSError:
                 pass
 
         if (
             thumb_path
-            and os.path.exists(thumb_path)
+            and os.path.exists(
+                thumb_path
+            )
         ):
             try:
-                os.remove(thumb_path)
+                os.remove(
+                    thumb_path
+                )
             except OSError:
                 pass
 
@@ -827,33 +1007,26 @@ async def photo_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not await is_joined(
-        context,
-        update.effective_user.id,
-    ):
-        await update.message.reply_text(
-            FORCE_SUB_TEXT,
-            reply_markup=join_markup(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    message = update.message
+
+    if message is None:
         return
 
-    msg = update.message
     state = get_state(
-        msg.from_user.id
+        message.from_user.id
     )
 
     if state.get("waiting") == "thumb":
         state["thumb_id"] = (
-            msg.photo[-1].file_id
+            message.photo[-1].file_id
         )
 
         state["waiting"] = None
 
         await delete_silently(
             context,
-            msg.chat_id,
-            msg.message_id,
+            message.chat_id,
+            message.message_id,
         )
 
         await show_file_menu(
@@ -865,7 +1038,7 @@ async def photo_handler(
         return
 
     state.update({
-        "file_id": msg.photo[-1].file_id,
+        "file_id": message.photo[-1].file_id,
         "file_name": "photo.jpg",
         "thumb_id": None,
         "caption": None,
@@ -884,19 +1057,24 @@ async def text_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    msg = update.message
+    message = update.message
+
+    if message is None:
+        return
 
     if (
-        not msg.text
-        or msg.text.startswith("/")
+        not message.text
+        or message.text.startswith("/")
     ):
         return
 
     state = get_state(
-        msg.from_user.id
+        message.from_user.id
     )
 
-    waiting = state.get("waiting")
+    waiting = state.get(
+        "waiting"
+    )
 
     if waiting not in (
         "rename",
@@ -905,7 +1083,7 @@ async def text_handler(
         return
 
     if waiting == "rename":
-        new_name = msg.text.strip()
+        new_name = message.text.strip()
 
         if not new_name:
             return
@@ -915,14 +1093,14 @@ async def text_handler(
         )
 
     else:
-        state["caption"] = msg.text
+        state["caption"] = message.text
 
     state["waiting"] = None
 
     await delete_silently(
         context,
-        msg.chat_id,
-        msg.message_id,
+        message.chat_id,
+        message.message_id,
     )
 
     await show_file_menu(
@@ -932,7 +1110,9 @@ async def text_handler(
     )
 
 
-async def handle_ping(request):
+async def handle_ping(
+    request,
+):
     return web.Response(
         text="Bot is alive!"
     )
@@ -951,7 +1131,9 @@ async def start_webserver():
         handle_ping,
     )
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(
+        app
+    )
 
     await runner.setup()
 
@@ -964,7 +1146,7 @@ async def start_webserver():
     await site.start()
 
     logger.info(
-        "Health-check server listening on port %s",
+        "Health server listening on port %s",
         PORT,
     )
 
@@ -983,7 +1165,21 @@ async def main():
 
     await check_bot.initialize()
 
-    app_bot.bot_data["check_bot"] = check_bot
+    await validate_force_sub_chats(
+        check_bot
+    )
+
+    app_bot.bot_data[
+        "check_bot"
+    ] = check_bot
+
+    app_bot.add_handler(
+        TypeHandler(
+            Update,
+            membership_gate,
+        ),
+        group=-1,
+    )
 
     app_bot.add_handler(
         CommandHandler(
@@ -1001,7 +1197,8 @@ async def main():
 
     app_bot.add_handler(
         MessageHandler(
-            filters.Document.ALL | filters.VIDEO,
+            filters.Document.ALL
+            | filters.VIDEO,
             file_handler,
         )
     )
@@ -1057,7 +1254,8 @@ async def main():
 
     app_bot.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.VIA_BOT,
+            filters.TEXT
+            & ~filters.VIA_BOT,
             text_handler,
         )
     )
@@ -1069,7 +1267,7 @@ async def main():
     await start_webserver()
 
     logger.info(
-        "Bot started. Polling for updates..."
+        "Bot started"
     )
 
     try:
